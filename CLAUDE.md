@@ -41,6 +41,10 @@ HWP/HWPX → Stage 1 (Parser) → IR → Stage 2 (LLM, optional) → Markdown
 - Providers: `anthropic/`, `openai/`, `gemini/`, `upstage/`, `ollama/`
 - Model name auto-detection: `claude-*` → Anthropic, `gpt-*` → OpenAI, etc.
 
+### Formatter (`internal/formatter/`)
+- **공문서 서식 변환** (`official.go`): 행정업무운영규정시행규칙 기준 항목 기호를 Markdown 헤딩/리스트로 치환
+- 7단계 계층: `1.`/`□` → `##`, `가.`/`○` → `-`, `1)` → `  -`, `가)` → `    -`, `(1)` → `      -`, `(가)` → `        -`, `①` → `          -`
+
 ### CLI (`internal/cli/`)
 - Entry point: `cmd/hwp2md/main.go`
 - Commands: `convert` (default), `extract`, `config`, `providers`
@@ -51,6 +55,7 @@ HWP/HWPX → Stage 1 (Parser) → IR → Stage 2 (LLM, optional) → Markdown
 | File | Purpose |
 |------|---------|
 | `internal/cli/convert.go` | Main conversion pipeline, parser/LLM orchestration |
+| `internal/formatter/official.go` | 공문서 항목 기호 감지 및 Markdown 치환 |
 | `internal/parser/hwpx/parser.go` | HWPX XML parsing, table/cell span handling |
 | `internal/parser/hwp5/parser.go` | HWP5 OLE2 parsing, main entry point |
 | `internal/parser/hwp5/section.go` | HWP5 section parsing, table/paragraph extraction |

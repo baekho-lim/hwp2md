@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/roboco-io/hwp2md/internal/config"
+	"github.com/roboco-io/hwp2md/internal/formatter"
 	"github.com/roboco-io/hwp2md/internal/ir"
 	"github.com/roboco-io/hwp2md/internal/llm"
 	"github.com/roboco-io/hwp2md/internal/llm/anthropic"
@@ -347,44 +348,89 @@ func convertToBasicMarkdown(doc *ir.Document) string {
 	}
 
 	// Content
+	prevWasListItem := false
 	for _, block := range doc.Content {
 		switch block.Type {
 		case ir.BlockTypeParagraph:
 			if block.Paragraph != nil {
-				writeMarkdownParagraph(&sb, block.Paragraph)
+				prevWasListItem = writeMarkdownParagraph(&sb, block.Paragraph, prevWasListItem)
 			}
 		case ir.BlockTypeTable:
+			if prevWasListItem {
+				sb.WriteString("\n")
+				prevWasListItem = false
+			}
 			if block.Table != nil {
 				writeMarkdownTable(&sb, block.Table)
 			}
 		case ir.BlockTypeImage:
+			if prevWasListItem {
+				sb.WriteString("\n")
+				prevWasListItem = false
+			}
 			if block.Image != nil {
 				writeMarkdownImage(&sb, block.Image)
 			}
 		case ir.BlockTypeList:
+			if prevWasListItem {
+				sb.WriteString("\n")
+				prevWasListItem = false
+			}
 			if block.List != nil {
 				writeMarkdownList(&sb, block.List)
 			}
 		}
 	}
+	// 마지막 블록이 리스트 항목이었으면 줄바꿈 추가
+	if prevWasListItem {
+		sb.WriteString("\n")
+	}
 
 	return sb.String()
 }
 
-func writeMarkdownParagraph(sb *strings.Builder, p *ir.Paragraph) {
+// writeMarkdownParagraph 는 단락을 Markdown으로 변환한다.
+// prevWasListItem이 true이면 이전 블록이 공문서 리스트 항목이었음을 의미한다.
+// 반환값은 현재 블록이 공문서 리스트 항목인지 여부이다.
+func writeMarkdownParagraph(sb *strings.Builder, p *ir.Paragraph, prevWasListItem bool) bool {
 	text := strings.TrimSpace(p.Text)
 	if text == "" {
-		return
+		return false
 	}
 
-	// Handle headings
+	// Handle headings from paragraph style
 	if p.Style.HeadingLevel > 0 && p.Style.HeadingLevel <= 6 {
+		if prevWasListItem {
+			sb.WriteString("\n")
+		}
 		prefix := strings.Repeat("#", p.Style.HeadingLevel)
 		sb.WriteString(fmt.Sprintf("%s %s\n\n", prefix, text))
-		return
+		return false
 	}
 
+	// 공문서 항목 기호 감지 및 변환
+	marker := formatter.DetectOfficialMarker(text)
+	if marker.Level != formatter.LevelNone {
+		formatted := formatter.FormatOfficialMarker(marker)
+		if marker.Level == formatter.Level1 {
+			// 최상위 항목 → ## 제목
+			if prevWasListItem {
+				sb.WriteString("\n")
+			}
+			sb.WriteString(formatted + "\n\n")
+			return false
+		}
+		// 하위 항목 → 들여쓰기 + "- " (연속 리스트 항목 사이 빈 줄 없음)
+		sb.WriteString(formatted + "\n")
+		return true
+	}
+
+	// 일반 단락
+	if prevWasListItem {
+		sb.WriteString("\n")
+	}
 	sb.WriteString(text + "\n\n")
+	return false
 }
 
 func writeMarkdownTable(sb *strings.Builder, t *ir.TableBlock) {
