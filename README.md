@@ -343,6 +343,7 @@ hwp2md/
 ├── internal/
 │   ├── cli/               # CLI 명령 구현
 │   ├── config/            # 설정 관리
+│   ├── formatter/         # 출력 서식 처리 (공문서 항목 기호 변환 등)
 │   ├── ir/                # 중간 표현 (Intermediate Representation)
 │   ├── llm/               # LLM 프로바이더
 │   │   ├── anthropic/     # Anthropic Claude
