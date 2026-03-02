@@ -12,6 +12,7 @@ Usage:
     python3 fill_hwpx.py <fill_plan.json> -o <output.hwpx>
     python3 fill_hwpx.py --inspect <template.hwpx>          # List all text runs
     python3 fill_hwpx.py --inspect <template.hwpx> -q <text> # Search for text
+    python3 fill_hwpx.py --inspect-tables <template.hwpx>   # Show table structure
 """
 
 import json
@@ -447,6 +448,7 @@ def inspect_template(template_path: str, query: str | None = None) -> None:
             xml_bytes = zf.read(section_file)
             tree = etree.fromstring(xml_bytes)
             text_elements = get_all_text_elements(tree)
+            parent_map = _build_parent_map(tree)
             total_elements += len(text_elements)
 
             print(f"Section: {section_file} ({len(text_elements)} text elements)\n")
@@ -458,9 +460,82 @@ def inspect_template(template_path: str, query: str | None = None) -> None:
                 if query and query.lower() not in text.lower():
                     continue
                 display = text[:100] + ("..." if len(text) > 100 else "")
-                print(f"  [{i:4d}] {display}")
+                context = ""
+                cell = _get_ancestor(elem, "tc", parent_map)
+                if cell is not None:
+                    table = _get_ancestor(cell, "tbl", parent_map)
+                    cell_addr = cell.find(f"./{HP_CELLADDR_TAG}")
+                    if table is not None and cell_addr is not None:
+                        table_idx = _get_table_index(tree, table)
+                        try:
+                            col = int(cell_addr.get("colAddr", "-1"))
+                            row = int(cell_addr.get("rowAddr", "-1"))
+                        except ValueError:
+                            col = -1
+                            row = -1
+                        context = f"[T{table_idx} R{row} C{col}]  "
+
+                print(f"  [{i:4d}] {context}{display}")
 
     print(f"\nTotal <hp:t> elements: {total_elements}")
+
+
+def _inspect_table_structure(template_path: str) -> None:
+    """Inspect table layout with cell coordinates and spans."""
+    section_files = find_section_xmls(template_path)
+
+    with zipfile.ZipFile(template_path, "r") as zf:
+        for section_file in section_files:
+            xml_bytes = zf.read(section_file)
+            tree = etree.fromstring(xml_bytes)
+            tables = tree.findall(f".//{HP_TBL_TAG}")
+
+            print(f"Section: {section_file} ({len(tables)} tables)\n")
+
+            for table_idx, table in enumerate(tables):
+                row_cnt = table.get("rowCnt", "?")
+                col_cnt = table.get("colCnt", "?")
+                print(f"  Table {table_idx}: {row_cnt} rows x {col_cnt} cols")
+
+                cell_infos = []
+                for cell in table.findall(f".//{HP_TC_TAG}"):
+                    cell_addr = cell.find(f"./{HP_CELLADDR_TAG}")
+                    if cell_addr is None:
+                        continue
+                    try:
+                        col = int(cell_addr.get("colAddr", "-1"))
+                        row = int(cell_addr.get("rowAddr", "-1"))
+                    except ValueError:
+                        col = -1
+                        row = -1
+
+                    cell_span = cell.find(f"./{HP_CELLSPAN_TAG}")
+                    if cell_span is not None:
+                        try:
+                            col_span = int(cell_span.get("colSpan", "1"))
+                            row_span = int(cell_span.get("rowSpan", "1"))
+                        except ValueError:
+                            col_span = 1
+                            row_span = 1
+                    else:
+                        col_span = 1
+                        row_span = 1
+
+                    text_parts = [t.text for t in cell.findall(f".//{HP_T_TAG}") if t.text]
+                    text = "".join(text_parts).strip()
+                    if not text:
+                        text = "[EMPTY]"
+
+                    cell_infos.append((row, col, col_span, row_span, text))
+
+                cell_infos.sort(key=lambda x: (x[0], x[1]))
+                for row, col, col_span, row_span, text in cell_infos:
+                    span = ""
+                    if col_span > 1 or row_span > 1:
+                        span = f" (span {col_span}x{row_span})"
+                    print(f"    R{row} C{col}{span}: {text}")
+
+                print()
 
 
 def main():
@@ -468,15 +543,19 @@ def main():
     parser.add_argument("plan", nargs="?", help="Path to fill_plan.json")
     parser.add_argument("-o", "--output", help="Override output path")
     parser.add_argument("--inspect", metavar="HWPX", help="Inspect template text runs")
+    parser.add_argument("--inspect-tables", metavar="HWPX", help="Show table structure of template")
     parser.add_argument("-q", "--query", help="Filter runs by text (with --inspect)")
     args = parser.parse_args()
 
     if args.inspect:
         inspect_template(args.inspect, args.query)
         return
+    if args.inspect_tables:
+        _inspect_table_structure(args.inspect_tables)
+        return
 
     if not args.plan:
-        parser.error("fill_plan.json is required (or use --inspect)")
+        parser.error("fill_plan.json is required (or use --inspect / --inspect-tables)")
 
     # Load plan
     plan = load_plan(args.plan)
