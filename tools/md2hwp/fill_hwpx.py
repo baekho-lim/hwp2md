@@ -12,6 +12,7 @@ Usage:
     python3 fill_hwpx.py <fill_plan.json> -o <output.hwpx>
     python3 fill_hwpx.py --inspect <template.hwpx>          # List all text runs
     python3 fill_hwpx.py --inspect <template.hwpx> -q <text> # Search for text
+    python3 fill_hwpx.py --inspect-tables <template.hwpx>   # Show table structure
 """
 
 import json
@@ -58,6 +59,106 @@ def _log_event(event: dict) -> None:
         return
     with open(EVENT_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def _build_parent_map(tree) -> dict:
+    """Build element-to-parent mapping for ancestor traversal."""
+    parent_map = {}
+    for parent in tree.iter():
+        for child in parent:
+            parent_map[child] = parent
+    return parent_map
+
+
+def _local_name(tag: str) -> str:
+    """Extract local tag name from a namespaced XML tag."""
+    if "}" in tag:
+        return tag.split("}", 1)[1]
+    return tag
+
+
+def _get_ancestor(elem, tag_local: str, parent_map: dict):
+    """Walk up parent chain to find ancestor by local tag name."""
+    current = parent_map.get(elem)
+    while current is not None:
+        tag = current.tag if isinstance(current.tag, str) else ""
+        if _local_name(tag) == tag_local:
+            return current
+        current = parent_map.get(current)
+    return None
+
+
+def _find_cell_by_addr(tbl, col: int, row: int):
+    """Find <hp:tc> by its <hp:cellAddr> coordinates."""
+    for tc in tbl.findall(f".//{HP_TC_TAG}"):
+        cell_addr = tc.find(f"./{HP_CELLADDR_TAG}")
+        if cell_addr is None:
+            continue
+        try:
+            col_addr = int(cell_addr.get("colAddr", "-1"))
+            row_addr = int(cell_addr.get("rowAddr", "-1"))
+        except ValueError:
+            continue
+        if col_addr == col and row_addr == row:
+            return tc
+    return None
+
+
+def _set_cell_text(tc, text: str) -> None:
+    """Set cell text, creating <hp:t> in first <hp:run> when absent."""
+    run = tc.find(f".//{HP_RUN_TAG}")
+    if run is None:
+        sub_list = tc.find(f"./{HP_SUBLIST_TAG}")
+        if sub_list is None:
+            sub_list = etree.Element(HP_SUBLIST_TAG)
+            tc.insert(0, sub_list)
+        paragraph = sub_list.find(f"./{HP_P_TAG}")
+        if paragraph is None:
+            paragraph = etree.Element(HP_P_TAG)
+            sub_list.append(paragraph)
+        run = etree.Element(HP_RUN_TAG)
+        paragraph.append(run)
+
+    text_elem = run.find(f"./{HP_T_TAG}")
+    if text_elem is None:
+        text_elem = etree.Element(HP_T_TAG)
+        run.append(text_elem)
+
+    text_elem.text = text
+    for child in list(text_elem):
+        text_elem.remove(child)
+
+
+def _clear_cell_except(tc, keep_elem, parent_map: dict) -> None:
+    """Clear a cell except the run/paragraph containing keep_elem."""
+    keep_run = _get_ancestor(keep_elem, "run", parent_map)
+    keep_paragraph = _get_ancestor(keep_elem, "p", parent_map)
+
+    for paragraph in list(tc.findall(f".//{HP_P_TAG}")):
+        paragraph_parent = parent_map.get(paragraph)
+        if paragraph is not keep_paragraph:
+            if paragraph_parent is not None:
+                paragraph_parent.remove(paragraph)
+            continue
+
+        for run in list(paragraph.findall(f"./{HP_RUN_TAG}")):
+            if run is keep_run:
+                continue
+            paragraph.remove(run)
+
+    if keep_run is not None:
+        for text_elem in list(keep_run.findall(f"./{HP_T_TAG}")):
+            if text_elem is keep_elem:
+                continue
+            keep_run.remove(text_elem)
+
+
+def _get_table_index(tree, tbl) -> int:
+    """Return ordinal table index in document tree."""
+    for idx, candidate in enumerate(tree.findall(f".//{HP_TBL_TAG}")):
+        if candidate is tbl:
+            return idx
+    return -1
 
 
 def load_plan(plan_path: str) -> dict:
@@ -135,22 +236,35 @@ def apply_section_replacements_xml(tree, replacements: list) -> int:
 
     Each replacement: {"section_id": str, "guide_text_prefix": str, "content": str}
     """
-    total = 0
+    parent_map = _build_parent_map(tree)
     text_elements = get_all_text_elements(tree)
+    total = 0
 
     for r in replacements:
         prefix = r["guide_text_prefix"]
         content = r["content"]
         section_id = r.get("section_id", "?")
+        clear_cell = r.get("clear_cell", True)
         replaced = False
 
         for elem_idx, elem in enumerate(text_elements):
             if elem.text and prefix in elem.text:
-                elem.text = elem.text.replace(prefix, content, 1)
+                elem.text = content
+                for child in list(elem):
+                    elem.remove(child)
+
+                if clear_cell:
+                    cell = _get_ancestor(elem, "tc", parent_map)
+                    if cell is not None:
+                        _clear_cell_except(cell, elem, parent_map)
+
                 total += 1
                 replaced = True
                 _log_event({"type": "replace", "idx": elem_idx, "find": prefix, "replace": content})
-                print(f"  Section {section_id}: replaced guide text")
+                if clear_cell:
+                    print(f"  Section {section_id}: replaced guide text (cell cleared)")
+                else:
+                    print(f"  Section {section_id}: replaced guide text")
                 break
 
         if not replaced:
@@ -168,51 +282,84 @@ def apply_table_cell_fills_xml(tree, fills: list) -> int:
 
     Each fill: {"find_label": str, "value": str}
 
-    Strategy: Find <hp:t> with the label text, then find the next <hp:t> element
-    that is in a different table cell (different parent chain) and replace it.
+    Primary strategy: cellAddr-based table lookup by offset.
+    Fallback strategy: flat scan for next text element in a different cell.
     """
     total = 0
+    parent_map = _build_parent_map(tree)
     text_elements = get_all_text_elements(tree)
-
-    # Build parent map for cell boundary detection
-    parent_map = {}
-    for parent in tree.iter():
-        for child in parent:
-            parent_map[child] = parent
-
-    def get_cell_ancestor(elem):
-        """Walk up to find the nearest table cell (hp:tc or similar)."""
-        current = elem
-        while current is not None:
-            tag = current.tag if isinstance(current.tag, str) else ""
-            if "tc" in tag.lower() or "cell" in tag.lower():
-                return current
-            current = parent_map.get(current)
-        return None
 
     for fill in fills:
         label = fill["find_label"]
         value = fill["value"]
+        offset = fill.get("target_offset", {"col": 1, "row": 0})
+        offset_col = int(offset.get("col", 1))
+        offset_row = int(offset.get("row", 0))
         found = False
 
-        for i, elem in enumerate(text_elements):
-            if elem.text and label in elem.text:
-                label_cell = get_cell_ancestor(elem)
+        exact_matches = [
+            (i, elem)
+            for i, elem in enumerate(text_elements)
+            if elem.text and elem.text.strip() == label
+        ]
+        contains_matches = [
+            (i, elem)
+            for i, elem in enumerate(text_elements)
+            if elem.text and label in elem.text
+        ]
+        matches = exact_matches if exact_matches else contains_matches
 
-                # Look for next non-empty text in a DIFFERENT cell
-                for j in range(i + 1, min(i + 30, len(text_elements))):
-                    next_elem = text_elements[j]
-                    if next_elem.text and next_elem.text.strip():
-                        next_cell = get_cell_ancestor(next_elem)
-                        # Only replace if it's in a different cell (or no cell found)
-                        if next_cell is not label_cell or next_cell is None:
-                            next_elem.text = value
-                            total += 1
-                            found = True
-                            _log_event({"type": "replace", "idx": j, "find": label, "replace": value})
-                            value_display = value[:40] + ("..." if len(value) > 40 else "")
-                            print(f"  Table cell '{label}' -> '{value_display}'")
-                            break
+        for i, elem in matches:
+            label_cell = _get_ancestor(elem, "tc", parent_map)
+            if label_cell is None:
+                continue
+
+            table = _get_ancestor(label_cell, "tbl", parent_map)
+            label_addr = label_cell.find(f"./{HP_CELLADDR_TAG}")
+
+            # Primary: cellAddr lookup with configurable target offset.
+            if table is not None and label_addr is not None:
+                try:
+                    label_col = int(label_addr.get("colAddr", "-1"))
+                    label_row = int(label_addr.get("rowAddr", "-1"))
+                except ValueError:
+                    label_col = -1
+                    label_row = -1
+
+                target_col = label_col + offset_col
+                target_row = label_row + offset_row
+                target_cell = _find_cell_by_addr(table, target_col, target_row)
+                if target_cell is not None:
+                    _set_cell_text(target_cell, value)
+                    total += 1
+                    found = True
+                    table_idx = _get_table_index(tree, table)
+                    _log_event({"type": "replace", "idx": i, "find": label, "replace": value})
+                    value_display = value[:40] + ("..." if len(value) > 40 else "")
+                    print(
+                        f"  Table cell '{label}' -> '{value_display}' "
+                        f"(T{table_idx} R{target_row} C{target_col})"
+                    )
+                    break
+
+            # Fallback: flat scan for first text element in a different cell.
+            for j in range(i + 1, min(i + 50, len(text_elements))):
+                next_elem = text_elements[j]
+                next_cell = _get_ancestor(next_elem, "tc", parent_map)
+                if next_cell is label_cell and next_cell is not None:
+                    continue
+
+                next_elem.text = value
+                for child in list(next_elem):
+                    next_elem.remove(child)
+                total += 1
+                found = True
+                _log_event({"type": "replace", "idx": j, "find": label, "replace": value})
+                value_display = value[:40] + ("..." if len(value) > 40 else "")
+                print(f"  Table cell '{label}' -> '{value_display}' (fallback)")
+                break
+
+            if found:
                 break
 
         if not found:
@@ -301,6 +448,7 @@ def inspect_template(template_path: str, query: str | None = None) -> None:
             xml_bytes = zf.read(section_file)
             tree = etree.fromstring(xml_bytes)
             text_elements = get_all_text_elements(tree)
+            parent_map = _build_parent_map(tree)
             total_elements += len(text_elements)
 
             print(f"Section: {section_file} ({len(text_elements)} text elements)\n")
@@ -312,9 +460,82 @@ def inspect_template(template_path: str, query: str | None = None) -> None:
                 if query and query.lower() not in text.lower():
                     continue
                 display = text[:100] + ("..." if len(text) > 100 else "")
-                print(f"  [{i:4d}] {display}")
+                context = ""
+                cell = _get_ancestor(elem, "tc", parent_map)
+                if cell is not None:
+                    table = _get_ancestor(cell, "tbl", parent_map)
+                    cell_addr = cell.find(f"./{HP_CELLADDR_TAG}")
+                    if table is not None and cell_addr is not None:
+                        table_idx = _get_table_index(tree, table)
+                        try:
+                            col = int(cell_addr.get("colAddr", "-1"))
+                            row = int(cell_addr.get("rowAddr", "-1"))
+                        except ValueError:
+                            col = -1
+                            row = -1
+                        context = f"[T{table_idx} R{row} C{col}]  "
+
+                print(f"  [{i:4d}] {context}{display}")
 
     print(f"\nTotal <hp:t> elements: {total_elements}")
+
+
+def _inspect_table_structure(template_path: str) -> None:
+    """Inspect table layout with cell coordinates and spans."""
+    section_files = find_section_xmls(template_path)
+
+    with zipfile.ZipFile(template_path, "r") as zf:
+        for section_file in section_files:
+            xml_bytes = zf.read(section_file)
+            tree = etree.fromstring(xml_bytes)
+            tables = tree.findall(f".//{HP_TBL_TAG}")
+
+            print(f"Section: {section_file} ({len(tables)} tables)\n")
+
+            for table_idx, table in enumerate(tables):
+                row_cnt = table.get("rowCnt", "?")
+                col_cnt = table.get("colCnt", "?")
+                print(f"  Table {table_idx}: {row_cnt} rows x {col_cnt} cols")
+
+                cell_infos = []
+                for cell in table.findall(f".//{HP_TC_TAG}"):
+                    cell_addr = cell.find(f"./{HP_CELLADDR_TAG}")
+                    if cell_addr is None:
+                        continue
+                    try:
+                        col = int(cell_addr.get("colAddr", "-1"))
+                        row = int(cell_addr.get("rowAddr", "-1"))
+                    except ValueError:
+                        col = -1
+                        row = -1
+
+                    cell_span = cell.find(f"./{HP_CELLSPAN_TAG}")
+                    if cell_span is not None:
+                        try:
+                            col_span = int(cell_span.get("colSpan", "1"))
+                            row_span = int(cell_span.get("rowSpan", "1"))
+                        except ValueError:
+                            col_span = 1
+                            row_span = 1
+                    else:
+                        col_span = 1
+                        row_span = 1
+
+                    text_parts = [t.text for t in cell.findall(f".//{HP_T_TAG}") if t.text]
+                    text = "".join(text_parts).strip()
+                    if not text:
+                        text = "[EMPTY]"
+
+                    cell_infos.append((row, col, col_span, row_span, text))
+
+                cell_infos.sort(key=lambda x: (x[0], x[1]))
+                for row, col, col_span, row_span, text in cell_infos:
+                    span = ""
+                    if col_span > 1 or row_span > 1:
+                        span = f" (span {col_span}x{row_span})"
+                    print(f"    R{row} C{col}{span}: {text}")
+
+                print()
 
 
 def main():
@@ -322,15 +543,19 @@ def main():
     parser.add_argument("plan", nargs="?", help="Path to fill_plan.json")
     parser.add_argument("-o", "--output", help="Override output path")
     parser.add_argument("--inspect", metavar="HWPX", help="Inspect template text runs")
+    parser.add_argument("--inspect-tables", metavar="HWPX", help="Show table structure of template")
     parser.add_argument("-q", "--query", help="Filter runs by text (with --inspect)")
     args = parser.parse_args()
 
     if args.inspect:
         inspect_template(args.inspect, args.query)
         return
+    if args.inspect_tables:
+        _inspect_table_structure(args.inspect_tables)
+        return
 
     if not args.plan:
-        parser.error("fill_plan.json is required (or use --inspect)")
+        parser.error("fill_plan.json is required (or use --inspect / --inspect-tables)")
 
     # Load plan
     plan = load_plan(args.plan)
