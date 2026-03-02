@@ -22,6 +22,7 @@ import argparse
 import shutil
 import tempfile
 import zipfile
+from copy import deepcopy
 from pathlib import Path
 
 try:
@@ -368,6 +369,72 @@ def apply_table_cell_fills_xml(tree, fills: list) -> int:
     return total
 
 
+def _create_paragraph(ref_p, text: str):
+    """Create paragraph by cloning reference paragraph style/layout."""
+    new_p = deepcopy(ref_p)
+
+    runs = new_p.findall(f"./{HP_RUN_TAG}")
+    if not runs:
+        run = etree.Element(HP_RUN_TAG)
+        new_p.append(run)
+        runs = [run]
+
+    for run in runs[1:]:
+        new_p.remove(run)
+
+    t_elem = runs[0].find(f"./{HP_T_TAG}")
+    if t_elem is None:
+        t_elem = etree.SubElement(runs[0], HP_T_TAG)
+    t_elem.text = text
+    for child in list(t_elem):
+        t_elem.remove(child)
+
+    return new_p
+
+
+def apply_multi_paragraph_fills(tree, fills: list) -> int:
+    """Inject multi-paragraph content into a target cell."""
+    parent_map = _build_parent_map(tree)
+    text_elements = get_all_text_elements(tree)
+    total = 0
+
+    for fill in fills:
+        section_id = fill.get("section_id", "?")
+        prefix = fill["guide_text_prefix"]
+        paragraphs = fill.get("paragraphs", [])
+        replaced = False
+
+        for elem_idx, elem in enumerate(text_elements):
+            if not (elem.text and prefix in elem.text):
+                continue
+
+            cell = _get_ancestor(elem, "tc", parent_map)
+            if cell is None:
+                continue
+            sub_list = cell.find(f"./{HP_SUBLIST_TAG}")
+            if sub_list is None:
+                continue
+            ref_p = sub_list.find(f"./{HP_P_TAG}")
+            if ref_p is None:
+                continue
+
+            for paragraph in list(sub_list.findall(f"./{HP_P_TAG}")):
+                sub_list.remove(paragraph)
+            for paragraph_text in paragraphs:
+                sub_list.append(_create_paragraph(ref_p, paragraph_text))
+
+            total += 1
+            replaced = True
+            _log_event({"type": "replace", "idx": elem_idx, "find": prefix, "replace": f"{len(paragraphs)} paragraphs"})
+            print(f"  Section {section_id}: inserted {len(paragraphs)} paragraph(s)")
+            break
+
+        if not replaced:
+            print(f"  WARNING: Section {section_id} multi-paragraph target not found", file=sys.stderr)
+
+    return total
+
+
 def fill_hwpx(plan: dict, output_path: str) -> int:
     """Main fill operation: copy template, modify XML, save."""
     template_path = plan["template_file"]
@@ -406,6 +473,11 @@ def fill_hwpx(plan: dict, output_path: str) -> int:
             if plan.get("table_cell_fills"):
                 print(f"\n--- Table Cell Fills ({section_file}) ---")
                 section_total += apply_table_cell_fills_xml(tree, plan["table_cell_fills"])
+
+            # 4. Multi-paragraph fills
+            if plan.get("multi_paragraph_fills"):
+                print(f"\n--- Multi Paragraph Fills ({section_file}) ---")
+                section_total += apply_multi_paragraph_fills(tree, plan["multi_paragraph_fills"])
 
             total_replacements += section_total
 
