@@ -281,51 +281,84 @@ def apply_table_cell_fills_xml(tree, fills: list) -> int:
 
     Each fill: {"find_label": str, "value": str}
 
-    Strategy: Find <hp:t> with the label text, then find the next <hp:t> element
-    that is in a different table cell (different parent chain) and replace it.
+    Primary strategy: cellAddr-based table lookup by offset.
+    Fallback strategy: flat scan for next text element in a different cell.
     """
     total = 0
+    parent_map = _build_parent_map(tree)
     text_elements = get_all_text_elements(tree)
-
-    # Build parent map for cell boundary detection
-    parent_map = {}
-    for parent in tree.iter():
-        for child in parent:
-            parent_map[child] = parent
-
-    def get_cell_ancestor(elem):
-        """Walk up to find the nearest table cell (hp:tc or similar)."""
-        current = elem
-        while current is not None:
-            tag = current.tag if isinstance(current.tag, str) else ""
-            if "tc" in tag.lower() or "cell" in tag.lower():
-                return current
-            current = parent_map.get(current)
-        return None
 
     for fill in fills:
         label = fill["find_label"]
         value = fill["value"]
+        offset = fill.get("target_offset", {"col": 1, "row": 0})
+        offset_col = int(offset.get("col", 1))
+        offset_row = int(offset.get("row", 0))
         found = False
 
-        for i, elem in enumerate(text_elements):
-            if elem.text and label in elem.text:
-                label_cell = get_cell_ancestor(elem)
+        exact_matches = [
+            (i, elem)
+            for i, elem in enumerate(text_elements)
+            if elem.text and elem.text.strip() == label
+        ]
+        contains_matches = [
+            (i, elem)
+            for i, elem in enumerate(text_elements)
+            if elem.text and label in elem.text
+        ]
+        matches = exact_matches if exact_matches else contains_matches
 
-                # Look for next non-empty text in a DIFFERENT cell
-                for j in range(i + 1, min(i + 30, len(text_elements))):
-                    next_elem = text_elements[j]
-                    if next_elem.text and next_elem.text.strip():
-                        next_cell = get_cell_ancestor(next_elem)
-                        # Only replace if it's in a different cell (or no cell found)
-                        if next_cell is not label_cell or next_cell is None:
-                            next_elem.text = value
-                            total += 1
-                            found = True
-                            _log_event({"type": "replace", "idx": j, "find": label, "replace": value})
-                            value_display = value[:40] + ("..." if len(value) > 40 else "")
-                            print(f"  Table cell '{label}' -> '{value_display}'")
-                            break
+        for i, elem in matches:
+            label_cell = _get_ancestor(elem, "tc", parent_map)
+            if label_cell is None:
+                continue
+
+            table = _get_ancestor(label_cell, "tbl", parent_map)
+            label_addr = label_cell.find(f"./{HP_CELLADDR_TAG}")
+
+            # Primary: cellAddr lookup with configurable target offset.
+            if table is not None and label_addr is not None:
+                try:
+                    label_col = int(label_addr.get("colAddr", "-1"))
+                    label_row = int(label_addr.get("rowAddr", "-1"))
+                except ValueError:
+                    label_col = -1
+                    label_row = -1
+
+                target_col = label_col + offset_col
+                target_row = label_row + offset_row
+                target_cell = _find_cell_by_addr(table, target_col, target_row)
+                if target_cell is not None:
+                    _set_cell_text(target_cell, value)
+                    total += 1
+                    found = True
+                    table_idx = _get_table_index(tree, table)
+                    _log_event({"type": "replace", "idx": i, "find": label, "replace": value})
+                    value_display = value[:40] + ("..." if len(value) > 40 else "")
+                    print(
+                        f"  Table cell '{label}' -> '{value_display}' "
+                        f"(T{table_idx} R{target_row} C{target_col})"
+                    )
+                    break
+
+            # Fallback: flat scan for first text element in a different cell.
+            for j in range(i + 1, min(i + 50, len(text_elements))):
+                next_elem = text_elements[j]
+                next_cell = _get_ancestor(next_elem, "tc", parent_map)
+                if next_cell is label_cell and next_cell is not None:
+                    continue
+
+                next_elem.text = value
+                for child in list(next_elem):
+                    next_elem.remove(child)
+                total += 1
+                found = True
+                _log_event({"type": "replace", "idx": j, "find": label, "replace": value})
+                value_display = value[:40] + ("..." if len(value) > 40 else "")
+                print(f"  Table cell '{label}' -> '{value_display}' (fallback)")
+                break
+
+            if found:
                 break
 
         if not found:
