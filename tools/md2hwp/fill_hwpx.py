@@ -235,22 +235,35 @@ def apply_section_replacements_xml(tree, replacements: list) -> int:
 
     Each replacement: {"section_id": str, "guide_text_prefix": str, "content": str}
     """
-    total = 0
+    parent_map = _build_parent_map(tree)
     text_elements = get_all_text_elements(tree)
+    total = 0
 
     for r in replacements:
         prefix = r["guide_text_prefix"]
         content = r["content"]
         section_id = r.get("section_id", "?")
+        clear_cell = r.get("clear_cell", True)
         replaced = False
 
         for elem_idx, elem in enumerate(text_elements):
             if elem.text and prefix in elem.text:
-                elem.text = elem.text.replace(prefix, content, 1)
+                elem.text = content
+                for child in list(elem):
+                    elem.remove(child)
+
+                if clear_cell:
+                    cell = _get_ancestor(elem, "tc", parent_map)
+                    if cell is not None:
+                        _clear_cell_except(cell, elem, parent_map)
+
                 total += 1
                 replaced = True
                 _log_event({"type": "replace", "idx": elem_idx, "find": prefix, "replace": content})
-                print(f"  Section {section_id}: replaced guide text")
+                if clear_cell:
+                    print(f"  Section {section_id}: replaced guide text (cell cleared)")
+                else:
+                    print(f"  Section {section_id}: replaced guide text")
                 break
 
         if not replaced:
