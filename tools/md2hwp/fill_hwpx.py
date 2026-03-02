@@ -60,6 +60,106 @@ def _log_event(event: dict) -> None:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
+def _build_parent_map(tree) -> dict:
+    """Build element-to-parent mapping for ancestor traversal."""
+    parent_map = {}
+    for parent in tree.iter():
+        for child in parent:
+            parent_map[child] = parent
+    return parent_map
+
+
+def _local_name(tag: str) -> str:
+    """Extract local tag name from a namespaced XML tag."""
+    if "}" in tag:
+        return tag.split("}", 1)[1]
+    return tag
+
+
+def _get_ancestor(elem, tag_local: str, parent_map: dict):
+    """Walk up parent chain to find ancestor by local tag name."""
+    current = parent_map.get(elem)
+    while current is not None:
+        tag = current.tag if isinstance(current.tag, str) else ""
+        if _local_name(tag) == tag_local:
+            return current
+        current = parent_map.get(current)
+    return None
+
+
+def _find_cell_by_addr(tbl, col: int, row: int):
+    """Find <hp:tc> by its <hp:cellAddr> coordinates."""
+    for tc in tbl.findall(f".//{HP_TC_TAG}"):
+        cell_addr = tc.find(f"./{HP_CELLADDR_TAG}")
+        if cell_addr is None:
+            continue
+        try:
+            col_addr = int(cell_addr.get("colAddr", "-1"))
+            row_addr = int(cell_addr.get("rowAddr", "-1"))
+        except ValueError:
+            continue
+        if col_addr == col and row_addr == row:
+            return tc
+    return None
+
+
+def _set_cell_text(tc, text: str) -> None:
+    """Set cell text, creating <hp:t> in first <hp:run> when absent."""
+    run = tc.find(f".//{HP_RUN_TAG}")
+    if run is None:
+        sub_list = tc.find(f"./{HP_SUBLIST_TAG}")
+        if sub_list is None:
+            sub_list = etree.Element(HP_SUBLIST_TAG)
+            tc.insert(0, sub_list)
+        paragraph = sub_list.find(f"./{HP_P_TAG}")
+        if paragraph is None:
+            paragraph = etree.Element(HP_P_TAG)
+            sub_list.append(paragraph)
+        run = etree.Element(HP_RUN_TAG)
+        paragraph.append(run)
+
+    text_elem = run.find(f"./{HP_T_TAG}")
+    if text_elem is None:
+        text_elem = etree.Element(HP_T_TAG)
+        run.append(text_elem)
+
+    text_elem.text = text
+    for child in list(text_elem):
+        text_elem.remove(child)
+
+
+def _clear_cell_except(tc, keep_elem, parent_map: dict) -> None:
+    """Clear a cell except the run/paragraph containing keep_elem."""
+    keep_run = _get_ancestor(keep_elem, "run", parent_map)
+    keep_paragraph = _get_ancestor(keep_elem, "p", parent_map)
+
+    for paragraph in list(tc.findall(f".//{HP_P_TAG}")):
+        paragraph_parent = parent_map.get(paragraph)
+        if paragraph is not keep_paragraph:
+            if paragraph_parent is not None:
+                paragraph_parent.remove(paragraph)
+            continue
+
+        for run in list(paragraph.findall(f"./{HP_RUN_TAG}")):
+            if run is keep_run:
+                continue
+            paragraph.remove(run)
+
+    if keep_run is not None:
+        for text_elem in list(keep_run.findall(f"./{HP_T_TAG}")):
+            if text_elem is keep_elem:
+                continue
+            keep_run.remove(text_elem)
+
+
+def _get_table_index(tree, tbl) -> int:
+    """Return ordinal table index in document tree."""
+    for idx, candidate in enumerate(tree.findall(f".//{HP_TBL_TAG}")):
+        if candidate is tbl:
+            return idx
+    return -1
+
+
 def load_plan(plan_path: str) -> dict:
     """Load and validate fill_plan.json."""
     with open(plan_path, encoding="utf-8") as f:
