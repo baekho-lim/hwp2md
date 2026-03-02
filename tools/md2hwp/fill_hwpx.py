@@ -13,15 +13,18 @@ Usage:
     python3 fill_hwpx.py --inspect <template.hwpx>          # List all text runs
     python3 fill_hwpx.py --inspect <template.hwpx> -q <text> # Search for text
     python3 fill_hwpx.py --inspect-tables <template.hwpx>   # Show table structure
+    python3 fill_hwpx.py --analyze <template.hwpx>          # Output fillable schema
 """
 
 import json
 import sys
 import os
 import argparse
+import re
 import shutil
 import tempfile
 import zipfile
+from copy import deepcopy
 from pathlib import Path
 
 try:
@@ -51,6 +54,7 @@ HP_CELLSPAN_TAG = f"{{{HWPX_NS['hp']}}}cellSpan"
 
 # Event logging for real-time UI
 EVENT_FILE = os.environ.get("MD2HWP_EVENT_FILE")
+PLACEHOLDER_PATTERNS = [r"OO+", r"○{2,}", r"0{3,}"]
 
 
 def _log_event(event: dict) -> None:
@@ -368,6 +372,72 @@ def apply_table_cell_fills_xml(tree, fills: list) -> int:
     return total
 
 
+def _create_paragraph(ref_p, text: str):
+    """Create paragraph by cloning reference paragraph style/layout."""
+    new_p = deepcopy(ref_p)
+
+    runs = new_p.findall(f"./{HP_RUN_TAG}")
+    if not runs:
+        run = etree.Element(HP_RUN_TAG)
+        new_p.append(run)
+        runs = [run]
+
+    for run in runs[1:]:
+        new_p.remove(run)
+
+    t_elem = runs[0].find(f"./{HP_T_TAG}")
+    if t_elem is None:
+        t_elem = etree.SubElement(runs[0], HP_T_TAG)
+    t_elem.text = text
+    for child in list(t_elem):
+        t_elem.remove(child)
+
+    return new_p
+
+
+def apply_multi_paragraph_fills(tree, fills: list) -> int:
+    """Inject multi-paragraph content into a target cell."""
+    parent_map = _build_parent_map(tree)
+    text_elements = get_all_text_elements(tree)
+    total = 0
+
+    for fill in fills:
+        section_id = fill.get("section_id", "?")
+        prefix = fill["guide_text_prefix"]
+        paragraphs = fill.get("paragraphs", [])
+        replaced = False
+
+        for elem_idx, elem in enumerate(text_elements):
+            if not (elem.text and prefix in elem.text):
+                continue
+
+            cell = _get_ancestor(elem, "tc", parent_map)
+            if cell is None:
+                continue
+            sub_list = cell.find(f"./{HP_SUBLIST_TAG}")
+            if sub_list is None:
+                continue
+            ref_p = sub_list.find(f"./{HP_P_TAG}")
+            if ref_p is None:
+                continue
+
+            for paragraph in list(sub_list.findall(f"./{HP_P_TAG}")):
+                sub_list.remove(paragraph)
+            for paragraph_text in paragraphs:
+                sub_list.append(_create_paragraph(ref_p, paragraph_text))
+
+            total += 1
+            replaced = True
+            _log_event({"type": "replace", "idx": elem_idx, "find": prefix, "replace": f"{len(paragraphs)} paragraphs"})
+            print(f"  Section {section_id}: inserted {len(paragraphs)} paragraph(s)")
+            break
+
+        if not replaced:
+            print(f"  WARNING: Section {section_id} multi-paragraph target not found", file=sys.stderr)
+
+    return total
+
+
 def fill_hwpx(plan: dict, output_path: str) -> int:
     """Main fill operation: copy template, modify XML, save."""
     template_path = plan["template_file"]
@@ -406,6 +476,11 @@ def fill_hwpx(plan: dict, output_path: str) -> int:
             if plan.get("table_cell_fills"):
                 print(f"\n--- Table Cell Fills ({section_file}) ---")
                 section_total += apply_table_cell_fills_xml(tree, plan["table_cell_fills"])
+
+            # 4. Multi-paragraph fills
+            if plan.get("multi_paragraph_fills"):
+                print(f"\n--- Multi Paragraph Fills ({section_file}) ---")
+                section_total += apply_multi_paragraph_fills(tree, plan["multi_paragraph_fills"])
 
             total_replacements += section_total
 
@@ -538,12 +613,124 @@ def _inspect_table_structure(template_path: str) -> None:
                 print()
 
 
+def _get_cell_text(tc) -> str:
+    """Get normalized text content of a table cell."""
+    return "".join((t.text or "") for t in tc.findall(f".//{HP_T_TAG}")).strip()
+
+
+def _parse_cell_addr(tc) -> tuple[int | None, int | None]:
+    """Parse cell address (colAddr, rowAddr) from <hp:cellAddr>."""
+    cell_addr = tc.find(f"./{HP_CELLADDR_TAG}")
+    if cell_addr is None:
+        return None, None
+    try:
+        return int(cell_addr.get("colAddr", "-1")), int(cell_addr.get("rowAddr", "-1"))
+    except ValueError:
+        return None, None
+
+
+def _detect_placeholder_pattern(text: str) -> str | None:
+    """Detect placeholder-like patterns such as OO/○○/000."""
+    for pattern in PLACEHOLDER_PATTERNS:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(0)
+    return None
+
+
+def _extract_table_schema(tree) -> list[dict]:
+    """Extract table layout and cell fillability metadata."""
+    tables = []
+    for table_idx, table in enumerate(tree.findall(f".//{HP_TBL_TAG}")):
+        row_cnt = table.get("rowCnt", "0")
+        col_cnt = table.get("colCnt", "0")
+        table_info = {
+            "index": table_idx,
+            "rows": int(row_cnt) if row_cnt.isdigit() else 0,
+            "cols": int(col_cnt) if col_cnt.isdigit() else 0,
+            "cells": [],
+        }
+        for cell in table.findall(f".//{HP_TC_TAG}"):
+            col, row = _parse_cell_addr(cell)
+            if col is None or row is None:
+                continue
+            text = _get_cell_text(cell)
+            cell_info = {"row": row, "col": col, "text": text}
+            if not text:
+                cell_info["is_empty"] = True
+            elif col == 0:
+                cell_info["is_label"] = True
+            table_info["cells"].append(cell_info)
+
+        table_info["cells"].sort(key=lambda c: (c["row"], c["col"]))
+        tables.append(table_info)
+    return tables
+
+
+def _extract_text_markers(tree, index_offset: int) -> tuple[list[dict], list[dict]]:
+    """Extract guide text markers and placeholders from text elements."""
+    guide_texts = []
+    placeholders = []
+    parent_map = _build_parent_map(tree)
+    text_elements = get_all_text_elements(tree)
+
+    for local_idx, elem in enumerate(text_elements):
+        text = (elem.text or "").strip()
+        if not text:
+            continue
+        element_index = index_offset + local_idx
+        cell = _get_ancestor(elem, "tc", parent_map)
+        table = _get_ancestor(cell, "tbl", parent_map) if cell is not None else None
+        table_index = _get_table_index(tree, table) if table is not None else -1
+        col, row = _parse_cell_addr(cell) if cell is not None else (None, None)
+
+        if text.startswith("※"):
+            guide = {"element_index": element_index, "prefix": text[:100]}
+            if table_index >= 0:
+                guide["table_index"] = table_index
+            if row is not None and col is not None:
+                guide["cell"] = f"R{row}C{col}"
+            guide_texts.append(guide)
+
+        pattern = _detect_placeholder_pattern(text)
+        if pattern:
+            placeholders.append({"element_index": element_index, "text": text, "pattern": pattern})
+
+    return guide_texts, placeholders
+
+
+def analyze_template(template_path: str) -> dict:
+    """Analyze template and return fillable schema metadata."""
+    schema = {
+        "template_file": template_path,
+        "total_text_elements": 0,
+        "tables": [],
+        "guide_texts": [],
+        "placeholders": [],
+    }
+    index_offset = 0
+
+    with zipfile.ZipFile(template_path, "r") as zf:
+        for section_file in find_section_xmls(template_path):
+            tree = etree.fromstring(zf.read(section_file))
+            text_elements = get_all_text_elements(tree)
+            schema["total_text_elements"] += len(text_elements)
+            schema["tables"].extend(_extract_table_schema(tree))
+            guide_texts, placeholders = _extract_text_markers(tree, index_offset)
+            schema["guide_texts"].extend(guide_texts)
+            schema["placeholders"].extend(placeholders)
+            index_offset += len(text_elements)
+
+    return schema
+
+
 def main():
     parser = argparse.ArgumentParser(description="Fill HWPX template with content")
     parser.add_argument("plan", nargs="?", help="Path to fill_plan.json")
     parser.add_argument("-o", "--output", help="Override output path")
     parser.add_argument("--inspect", metavar="HWPX", help="Inspect template text runs")
     parser.add_argument("--inspect-tables", metavar="HWPX", help="Show table structure of template")
+    parser.add_argument("--analyze", metavar="HWPX", help="Analyze template and output JSON schema")
     parser.add_argument("-q", "--query", help="Filter runs by text (with --inspect)")
     args = parser.parse_args()
 
@@ -553,9 +740,12 @@ def main():
     if args.inspect_tables:
         _inspect_table_structure(args.inspect_tables)
         return
+    if args.analyze:
+        print(json.dumps(analyze_template(args.analyze), ensure_ascii=False, indent=2))
+        return
 
     if not args.plan:
-        parser.error("fill_plan.json is required (or use --inspect / --inspect-tables)")
+        parser.error("fill_plan.json is required (or use --inspect / --inspect-tables / --analyze)")
 
     # Load plan
     plan = load_plan(args.plan)
