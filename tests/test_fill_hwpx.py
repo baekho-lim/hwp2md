@@ -227,7 +227,7 @@ def test_apply_table_cell_fills_xml_fills_empty_target_cell():
     assert _first_text(target) == "VALUE"
 
 
-def test_apply_table_cell_fills_xml_fallback_does_not_modify_non_table_text():
+def test_apply_table_cell_fills_xml_fallback_does_not_cross_into_other_table():
     root = etree.Element("root")
     root.append(_make_table([_make_cell(0, 0, "LABEL")]))
     body_p = etree.SubElement(root, fh.HP_P_TAG)
@@ -242,9 +242,9 @@ def test_apply_table_cell_fills_xml_fallback_does_not_modify_non_table_text():
         [{"find_label": "LABEL", "value": "VALUE", "target_offset": {"col": 99, "row": 0}}],
     )
 
-    assert total == 1
+    assert total == 0
     assert body_t.text == "BODY_TEXT"
-    assert _first_text(fallback_target) == "VALUE"
+    assert _first_text(fallback_target) == "TARGET"
 
 
 def test_apply_multi_paragraph_fills_injects_multiple_paragraphs():

@@ -341,11 +341,11 @@ def apply_table_cell_fills_xml(tree, fills: list) -> int:
             if label_cell is None:
                 continue
 
-            table = _get_ancestor(label_cell, "tbl", parent_map)
+            label_tbl = _get_ancestor(label_cell, "tbl", parent_map)
             label_addr = label_cell.find(f"./{HP_CELLADDR_TAG}")
 
             # Primary: cellAddr lookup with configurable target offset.
-            if table is not None and label_addr is not None:
+            if label_tbl is not None and label_addr is not None:
                 try:
                     label_col = int(label_addr.get("colAddr", "-1"))
                     label_row = int(label_addr.get("rowAddr", "-1"))
@@ -355,12 +355,12 @@ def apply_table_cell_fills_xml(tree, fills: list) -> int:
 
                 target_col = label_col + offset_col
                 target_row = label_row + offset_row
-                target_cell = _find_cell_by_addr(table, target_col, target_row)
+                target_cell = _find_cell_by_addr(label_tbl, target_col, target_row)
                 if target_cell is not None:
                     _set_cell_text(target_cell, value)
                     total += 1
                     found = True
-                    table_idx = _get_table_index(tree, table)
+                    table_idx = _get_table_index(tree, label_tbl)
                     _log_event({"type": "replace", "idx": i, "find": label, "replace": value})
                     value_display = value[:40] + ("..." if len(value) > 40 else "")
                     print(
@@ -373,7 +373,8 @@ def apply_table_cell_fills_xml(tree, fills: list) -> int:
             for j in range(i + 1, min(i + 50, len(text_elements))):
                 next_elem = text_elements[j]
                 next_cell = _get_ancestor(next_elem, "tc", parent_map)
-                if next_cell is None or next_cell is label_cell:
+                next_tbl = _get_ancestor(next_cell, "tbl", parent_map) if next_cell is not None else None
+                if next_cell is None or next_cell is label_cell or next_tbl is not label_tbl:
                     continue
 
                 next_elem.text = value
