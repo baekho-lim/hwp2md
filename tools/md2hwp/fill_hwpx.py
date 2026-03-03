@@ -94,17 +94,20 @@ def _get_ancestor(elem, tag_local: str, parent_map: dict):
 
 def _find_cell_by_addr(tbl, col: int, row: int):
     """Find <hp:tc> by its <hp:cellAddr> coordinates."""
-    for tc in tbl.findall(f".//{HP_TC_TAG}"):
-        cell_addr = tc.find(f"./{HP_CELLADDR_TAG}")
-        if cell_addr is None:
-            continue
-        try:
-            col_addr = int(cell_addr.get("colAddr", "-1"))
-            row_addr = int(cell_addr.get("rowAddr", "-1"))
-        except ValueError:
-            continue
-        if col_addr == col and row_addr == row:
-            return tc
+    for tr in tbl:
+        for tc in tr:
+            if tc.tag != HP_TC_TAG:
+                continue
+            cell_addr = tc.find(f"./{HP_CELLADDR_TAG}")
+            if cell_addr is None:
+                continue
+            try:
+                col_addr = int(cell_addr.get("colAddr", "-1"))
+                row_addr = int(cell_addr.get("rowAddr", "-1"))
+            except ValueError:
+                continue
+            if col_addr == col and row_addr == row:
+                return tc
     return None
 
 
@@ -137,18 +140,20 @@ def _clear_cell_except(tc, keep_elem, parent_map: dict) -> None:
     """Clear a cell except the run/paragraph containing keep_elem."""
     keep_run = _get_ancestor(keep_elem, "run", parent_map)
     keep_paragraph = _get_ancestor(keep_elem, "p", parent_map)
+    sub_list = tc.find(f"./{HP_SUBLIST_TAG}")
 
-    for paragraph in list(tc.findall(f".//{HP_P_TAG}")):
-        paragraph_parent = parent_map.get(paragraph)
-        if paragraph is not keep_paragraph:
-            if paragraph_parent is not None:
-                paragraph_parent.remove(paragraph)
-            continue
-
-        for run in list(paragraph.findall(f"./{HP_RUN_TAG}")):
-            if run is keep_run:
+    if sub_list is not None:
+        for paragraph in list(sub_list.findall(f"./{HP_P_TAG}")):
+            paragraph_parent = parent_map.get(paragraph)
+            if paragraph is not keep_paragraph:
+                if paragraph_parent is not None:
+                    paragraph_parent.remove(paragraph)
                 continue
-            paragraph.remove(run)
+
+            for run in list(paragraph.findall(f"./{HP_RUN_TAG}")):
+                if run is keep_run:
+                    continue
+                paragraph.remove(run)
 
     if keep_run is not None:
         for text_elem in list(keep_run.findall(f"./{HP_T_TAG}")):
