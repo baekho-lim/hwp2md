@@ -350,7 +350,7 @@ def apply_table_cell_fills_xml(tree, fills: list) -> int:
             for j in range(i + 1, min(i + 50, len(text_elements))):
                 next_elem = text_elements[j]
                 next_cell = _get_ancestor(next_elem, "tc", parent_map)
-                if next_cell is label_cell and next_cell is not None:
+                if next_cell is None or next_cell is label_cell:
                     continue
 
                 next_elem.text = value
