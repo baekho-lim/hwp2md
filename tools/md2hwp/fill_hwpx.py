@@ -178,6 +178,24 @@ def load_plan(plan_path: str) -> dict:
     if not os.path.exists(plan["template_file"]):
         raise FileNotFoundError(f"Template file not found: {plan['template_file']}")
 
+    for r in plan.get("simple_replacements", []):
+        if not r.get("find"):
+            raise ValueError("simple_replacements: 'find' must be non-empty")
+
+    for r in plan.get("section_replacements", []):
+        if not r.get("guide_text_prefix"):
+            raise ValueError("section_replacements: 'guide_text_prefix' must be non-empty")
+
+    for r in plan.get("table_cell_fills", []):
+        if not r.get("find_label"):
+            raise ValueError("table_cell_fills: 'find_label' must be non-empty")
+
+    for r in plan.get("multi_paragraph_fills", []):
+        if not r.get("guide_text_prefix"):
+            raise ValueError("multi_paragraph_fills: 'guide_text_prefix' must be non-empty")
+        if not r.get("paragraphs"):
+            raise ValueError("multi_paragraph_fills: 'paragraphs' must be non-empty")
+
     return plan
 
 
