@@ -54,7 +54,8 @@ HP_CELLSPAN_TAG = f"{{{HWPX_NS['hp']}}}cellSpan"
 
 # Event logging for real-time UI
 EVENT_FILE = os.environ.get("MD2HWP_EVENT_FILE")
-PLACEHOLDER_PATTERNS = [r"OO+", r"○{2,}", r"0{3,}"]
+PLACEHOLDER_PATTERNS = [r"OO+", r"○{2,}"]
+NUMERIC_PLACEHOLDER_PATTERN = r"(?<![0-9,])(0{3,})(?:원|년|월|일)?(?!\d)"
 
 
 def _log_event(event: dict) -> None:
@@ -644,6 +645,9 @@ def _detect_placeholder_pattern(text: str) -> str | None:
         match = re.search(pattern, text)
         if match:
             return match.group(0)
+    numeric_match = re.search(NUMERIC_PLACEHOLDER_PATTERN, text)
+    if numeric_match:
+        return numeric_match.group(1)
     return None
 
 

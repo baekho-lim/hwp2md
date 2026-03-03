@@ -144,7 +144,14 @@ def test_get_table_index():
 
 @pytest.mark.parametrize(
     ("text", "pattern"),
-    [("OO기업", "OO"), ("○○○", "○○○"), ("1000", "000"), ("일반 텍스트", None)],
+    [
+        ("OO기업", "OO"),
+        ("○○○", "○○○"),
+        ("0000원", "0000"),
+        ("1000", None),
+        ("3,448,000", None),
+        ("일반 텍스트", None),
+    ],
 )
 def test_detect_placeholder_pattern(text, pattern):
     assert fh._detect_placeholder_pattern(text) == pattern
@@ -418,6 +425,15 @@ def test_analyze_cli_outputs_valid_schema():
     assert len(data["placeholders"]) > 0
 
 
+def test_analyze_excludes_comma_formatted_amount_placeholders():
+    data = fh.analyze_template(str(TEMPLATE_PATH))
+    placeholder_texts = {entry["text"] for entry in data["placeholders"]}
+    assert "3,448,000" not in placeholder_texts
+    assert "7,652,000" not in placeholder_texts
+    assert "7,000,000" not in placeholder_texts
+    assert any("OO" in text or "○○" in text for text in placeholder_texts)
+
+
 def test_full_fill_cycle_with_reverse_conversion_if_available(tmp_path):
     if not HWP2MD_BIN.exists():
         pytest.skip("bin/hwp2md not found")
@@ -452,11 +468,34 @@ def test_e2e_fill_with_sample_plan(tmp_path):
 
     with zipfile.ZipFile(output) as zf:
         assert "Contents/section0.xml" in zf.namelist()
+        tree = etree.fromstring(zf.read("Contents/section0.xml"))
+
+    # XML is the source of truth for paragraph structure in table cells.
+    target_paragraphs = None
+    expected_paragraphs = [
+        "테스트 준비현황 문단 1",
+        "테스트 준비현황 문단 2",
+        "테스트 준비현황 문단 3",
+    ]
+    for tc in tree.findall(f".//{fh.HP_TC_TAG}"):
+        paragraphs = []
+        for p in tc.findall(f"./{fh.HP_SUBLIST_TAG}/{fh.HP_P_TAG}"):
+            text = "".join((t.text or "") for t in p.findall(f".//{fh.HP_T_TAG}")).strip()
+            if text:
+                paragraphs.append(text)
+        if paragraphs[:3] == expected_paragraphs:
+            target_paragraphs = paragraphs
+            break
+    assert target_paragraphs is not None, "multi_paragraph_fills content not found as separate XML paragraphs"
+    assert target_paragraphs[:3] == expected_paragraphs
 
     if HWP2MD_BIN.exists():
         verify_path = tmp_path / "e2e_verify.md"
         subprocess.run([str(HWP2MD_BIN), str(output), "-o", str(verify_path)], check=True)
         md = verify_path.read_text(encoding="utf-8")
+        # Reverse markdown check is for content presence only.
+        for text in expected_paragraphs:
+            assert text in md
         assert "테스트 과제명" in md
         assert "테스트 기업명" in md
     else:
