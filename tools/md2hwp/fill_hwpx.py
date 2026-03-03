@@ -304,6 +304,78 @@ def apply_section_replacements_xml(tree, replacements: list) -> int:
     return total
 
 
+def _find_label_matches(text_elements: list, label: str) -> list[tuple[int, object]]:
+    """Find label matches, preferring exact text matches over contains matches."""
+    exact_matches = [(i, elem) for i, elem in enumerate(text_elements) if elem.text and elem.text.strip() == label]
+    if exact_matches:
+        return exact_matches
+    return [(i, elem) for i, elem in enumerate(text_elements) if elem.text and label in elem.text]
+
+
+def _try_celladdr_fill(
+    tree,
+    label_idx: int,
+    label: str,
+    value: str,
+    label_cell,
+    label_addr,
+    offset_col: int,
+    offset_row: int,
+    parent_map: dict,
+) -> bool:
+    """Try table fill using cellAddr coordinates and target offset."""
+    label_tbl = _get_ancestor(label_cell, "tbl", parent_map)
+    if label_tbl is None or label_addr is None:
+        return False
+
+    try:
+        label_col = int(label_addr.get("colAddr", "-1"))
+        label_row = int(label_addr.get("rowAddr", "-1"))
+    except ValueError:
+        label_col = -1
+        label_row = -1
+
+    target_col = label_col + offset_col
+    target_row = label_row + offset_row
+    target_cell = _find_cell_by_addr(label_tbl, target_col, target_row)
+    if target_cell is None:
+        return False
+
+    _set_cell_text(target_cell, value)
+    table_idx = _get_table_index(tree, label_tbl)
+    _log_event({"type": "replace", "idx": label_idx, "find": label, "replace": value})
+    value_display = value[:40] + ("..." if len(value) > 40 else "")
+    print(f"  Table cell '{label}' -> '{value_display}' (T{table_idx} R{target_row} C{target_col})")
+    return True
+
+
+def _try_fallback_fill(
+    text_elements: list,
+    start_idx: int,
+    label: str,
+    value: str,
+    label_cell,
+    parent_map: dict,
+) -> bool:
+    """Try table fill by scanning nearby text elements within the same table."""
+    label_tbl = _get_ancestor(label_cell, "tbl", parent_map)
+    for j in range(start_idx + 1, min(start_idx + 50, len(text_elements))):
+        next_elem = text_elements[j]
+        next_cell = _get_ancestor(next_elem, "tc", parent_map)
+        next_tbl = _get_ancestor(next_cell, "tbl", parent_map) if next_cell is not None else None
+        if next_cell is None or next_cell is label_cell or next_tbl is not label_tbl:
+            continue
+
+        next_elem.text = value
+        for child in list(next_elem):
+            next_elem.remove(child)
+        _log_event({"type": "replace", "idx": j, "find": label, "replace": value})
+        value_display = value[:40] + ("..." if len(value) > 40 else "")
+        print(f"  Table cell '{label}' -> '{value_display}' (fallback)")
+        return True
+    return False
+
+
 def apply_table_cell_fills_xml(tree, fills: list) -> int:
     """Fill table cells by finding label text and replacing the adjacent value cell.
 
@@ -323,70 +395,21 @@ def apply_table_cell_fills_xml(tree, fills: list) -> int:
         offset_col = int(offset.get("col", 1))
         offset_row = int(offset.get("row", 0))
         found = False
-
-        exact_matches = [
-            (i, elem)
-            for i, elem in enumerate(text_elements)
-            if elem.text and elem.text.strip() == label
-        ]
-        contains_matches = [
-            (i, elem)
-            for i, elem in enumerate(text_elements)
-            if elem.text and label in elem.text
-        ]
-        matches = exact_matches if exact_matches else contains_matches
+        matches = _find_label_matches(text_elements, label)
 
         for i, elem in matches:
             label_cell = _get_ancestor(elem, "tc", parent_map)
             if label_cell is None:
                 continue
 
-            table = _get_ancestor(label_cell, "tbl", parent_map)
             label_addr = label_cell.find(f"./{HP_CELLADDR_TAG}")
-
-            # Primary: cellAddr lookup with configurable target offset.
-            if table is not None and label_addr is not None:
-                try:
-                    label_col = int(label_addr.get("colAddr", "-1"))
-                    label_row = int(label_addr.get("rowAddr", "-1"))
-                except ValueError:
-                    label_col = -1
-                    label_row = -1
-
-                target_col = label_col + offset_col
-                target_row = label_row + offset_row
-                target_cell = _find_cell_by_addr(table, target_col, target_row)
-                if target_cell is not None:
-                    _set_cell_text(target_cell, value)
-                    total += 1
-                    found = True
-                    table_idx = _get_table_index(tree, table)
-                    _log_event({"type": "replace", "idx": i, "find": label, "replace": value})
-                    value_display = value[:40] + ("..." if len(value) > 40 else "")
-                    print(
-                        f"  Table cell '{label}' -> '{value_display}' "
-                        f"(T{table_idx} R{target_row} C{target_col})"
-                    )
-                    break
-
-            # Fallback: flat scan for first text element in a different cell.
-            for j in range(i + 1, min(i + 50, len(text_elements))):
-                next_elem = text_elements[j]
-                next_cell = _get_ancestor(next_elem, "tc", parent_map)
-                if next_cell is None or next_cell is label_cell:
-                    continue
-
-                next_elem.text = value
-                for child in list(next_elem):
-                    next_elem.remove(child)
+            if _try_celladdr_fill(tree, i, label, value, label_cell, label_addr, offset_col, offset_row, parent_map):
                 total += 1
                 found = True
-                _log_event({"type": "replace", "idx": j, "find": label, "replace": value})
-                value_display = value[:40] + ("..." if len(value) > 40 else "")
-                print(f"  Table cell '{label}' -> '{value_display}' (fallback)")
                 break
-
-            if found:
+            if _try_fallback_fill(text_elements, i, label, value, label_cell, parent_map):
+                total += 1
+                found = True
                 break
 
         if not found:
@@ -464,51 +487,32 @@ def apply_multi_paragraph_fills(tree, fills: list) -> int:
 def fill_hwpx(plan: dict, output_path: str) -> int:
     """Main fill operation: copy template, modify XML, save."""
     template_path = plan["template_file"]
-
-    # Copy template to output
     shutil.copy2(template_path, output_path)
-
-    # Find section XMLs
     section_files = find_section_xmls(template_path)
     if not section_files:
         raise ValueError("No section XML files found in HWPX")
-
     print(f"Found {len(section_files)} section(s): {', '.join(section_files)}")
 
     total_replacements = 0
-
-    # Process each section XML
     with zipfile.ZipFile(template_path, "r") as zf_in:
         for section_file in section_files:
-            xml_bytes = zf_in.read(section_file)
-            tree = etree.fromstring(xml_bytes)
-
+            tree = etree.fromstring(zf_in.read(section_file))
             section_total = 0
-
-            # 1. Simple replacements
             if plan.get("simple_replacements"):
                 print(f"\n--- Simple Replacements ({section_file}) ---")
                 section_total += apply_simple_replacements_xml(tree, plan["simple_replacements"])
-
-            # 2. Section replacements
             if plan.get("section_replacements"):
                 print(f"\n--- Section Replacements ({section_file}) ---")
                 section_total += apply_section_replacements_xml(tree, plan["section_replacements"])
-
-            # 3. Table cell fills
             if plan.get("table_cell_fills"):
                 print(f"\n--- Table Cell Fills ({section_file}) ---")
                 section_total += apply_table_cell_fills_xml(tree, plan["table_cell_fills"])
-
-            # 4. Multi-paragraph fills
             if plan.get("multi_paragraph_fills"):
                 print(f"\n--- Multi Paragraph Fills ({section_file}) ---")
                 section_total += apply_multi_paragraph_fills(tree, plan["multi_paragraph_fills"])
 
             total_replacements += section_total
-
             if section_total > 0:
-                # Write modified XML back into the ZIP
                 modified_xml = etree.tostring(tree, xml_declaration=True, encoding="UTF-8")
                 _update_zip_file(output_path, section_file, modified_xml)
                 print(f"  Updated {section_file} ({section_total} replacements)")
@@ -578,61 +582,43 @@ def inspect_template(template_path: str, query: str | None = None) -> None:
     print(f"\nTotal <hp:t> elements: {total_elements}")
 
 
+def _collect_table_cell_infos(table) -> list[tuple[int, int, int, int, str]]:
+    """Collect row/col/span/text info from table cells."""
+    cell_infos = []
+    for cell in table.findall(f".//{HP_TC_TAG}"):
+        col, row = _parse_cell_addr(cell)
+        if col is None or row is None:
+            continue
+        cell_span = cell.find(f"./{HP_CELLSPAN_TAG}")
+        if cell_span is not None:
+            try:
+                col_span = int(cell_span.get("colSpan", "1"))
+                row_span = int(cell_span.get("rowSpan", "1"))
+            except ValueError:
+                col_span = 1
+                row_span = 1
+        else:
+            col_span = 1
+            row_span = 1
+        text = _get_cell_text(cell) or "[EMPTY]"
+        cell_infos.append((row, col, col_span, row_span, text))
+    return sorted(cell_infos, key=lambda x: (x[0], x[1]))
+
+
 def _inspect_table_structure(template_path: str) -> None:
     """Inspect table layout with cell coordinates and spans."""
-    section_files = find_section_xmls(template_path)
-
     with zipfile.ZipFile(template_path, "r") as zf:
-        for section_file in section_files:
-            xml_bytes = zf.read(section_file)
-            tree = etree.fromstring(xml_bytes)
+        for section_file in find_section_xmls(template_path):
+            tree = etree.fromstring(zf.read(section_file))
             tables = tree.findall(f".//{HP_TBL_TAG}")
-
             print(f"Section: {section_file} ({len(tables)} tables)\n")
-
             for table_idx, table in enumerate(tables):
                 row_cnt = table.get("rowCnt", "?")
                 col_cnt = table.get("colCnt", "?")
                 print(f"  Table {table_idx}: {row_cnt} rows x {col_cnt} cols")
-
-                cell_infos = []
-                for cell in table.findall(f".//{HP_TC_TAG}"):
-                    cell_addr = cell.find(f"./{HP_CELLADDR_TAG}")
-                    if cell_addr is None:
-                        continue
-                    try:
-                        col = int(cell_addr.get("colAddr", "-1"))
-                        row = int(cell_addr.get("rowAddr", "-1"))
-                    except ValueError:
-                        col = -1
-                        row = -1
-
-                    cell_span = cell.find(f"./{HP_CELLSPAN_TAG}")
-                    if cell_span is not None:
-                        try:
-                            col_span = int(cell_span.get("colSpan", "1"))
-                            row_span = int(cell_span.get("rowSpan", "1"))
-                        except ValueError:
-                            col_span = 1
-                            row_span = 1
-                    else:
-                        col_span = 1
-                        row_span = 1
-
-                    text_parts = [t.text for t in cell.findall(f".//{HP_T_TAG}") if t.text]
-                    text = "".join(text_parts).strip()
-                    if not text:
-                        text = "[EMPTY]"
-
-                    cell_infos.append((row, col, col_span, row_span, text))
-
-                cell_infos.sort(key=lambda x: (x[0], x[1]))
-                for row, col, col_span, row_span, text in cell_infos:
-                    span = ""
-                    if col_span > 1 or row_span > 1:
-                        span = f" (span {col_span}x{row_span})"
+                for row, col, col_span, row_span, text in _collect_table_cell_infos(table):
+                    span = f" (span {col_span}x{row_span})" if col_span > 1 or row_span > 1 else ""
                     print(f"    R{row} C{col}{span}: {text}")
-
                 print()
 
 

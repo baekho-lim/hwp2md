@@ -89,6 +89,21 @@ def test_find_cell_by_addr():
     assert _first_text(tc) == "B"
 
 
+def test_find_cell_by_addr_ignores_nested_table():
+    inner_cell = _make_cell(1, 0, "NESTED")
+    inner_tbl = _make_table([inner_cell])
+
+    outer_cell = _make_cell(0, 0, "OUTER")
+    outer_sub = outer_cell.find(f"./{fh.HP_SUBLIST_TAG}")
+    outer_sub.append(inner_tbl)
+    target = _make_cell(1, 0, "TARGET")
+    outer_tbl = _make_table([outer_cell, target])
+
+    result = fh._find_cell_by_addr(outer_tbl, 1, 0)
+    assert result is not None
+    assert _first_text(result) == "TARGET"
+
+
 def test_set_cell_text_creates_hp_t_for_empty_cell():
     tc = _make_cell(0, 0, with_text=False)
     assert tc.find(f".//{fh.HP_T_TAG}") is None
@@ -133,6 +148,54 @@ def test_get_table_index():
 )
 def test_detect_placeholder_pattern(text, pattern):
     assert fh._detect_placeholder_pattern(text) == pattern
+
+
+def test_load_plan_rejects_empty_find(tmp_path):
+    plan_path = tmp_path / "plan_empty_find.json"
+    plan = {
+        "template_file": str(TEMPLATE_PATH),
+        "output_file": str(tmp_path / "out.hwpx"),
+        "simple_replacements": [{"find": "", "replace": "X"}],
+    }
+    plan_path.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="simple_replacements: 'find' must be non-empty"):
+        fh.load_plan(str(plan_path))
+
+
+def test_load_plan_rejects_empty_guide_text_prefix(tmp_path):
+    plan_path = tmp_path / "plan_empty_section_prefix.json"
+    plan = {
+        "template_file": str(TEMPLATE_PATH),
+        "output_file": str(tmp_path / "out.hwpx"),
+        "section_replacements": [{"guide_text_prefix": "", "content": "X"}],
+    }
+    plan_path.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="section_replacements: 'guide_text_prefix' must be non-empty"):
+        fh.load_plan(str(plan_path))
+
+
+def test_load_plan_rejects_empty_find_label(tmp_path):
+    plan_path = tmp_path / "plan_empty_find_label.json"
+    plan = {
+        "template_file": str(TEMPLATE_PATH),
+        "output_file": str(tmp_path / "out.hwpx"),
+        "table_cell_fills": [{"find_label": "", "value": "X"}],
+    }
+    plan_path.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="table_cell_fills: 'find_label' must be non-empty"):
+        fh.load_plan(str(plan_path))
+
+
+def test_load_plan_rejects_empty_multi_paragraph_prefix(tmp_path):
+    plan_path = tmp_path / "plan_empty_multi_prefix.json"
+    plan = {
+        "template_file": str(TEMPLATE_PATH),
+        "output_file": str(tmp_path / "out.hwpx"),
+        "multi_paragraph_fills": [{"guide_text_prefix": "", "paragraphs": ["A"]}],
+    }
+    plan_path.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="multi_paragraph_fills: 'guide_text_prefix' must be non-empty"):
+        fh.load_plan(str(plan_path))
 
 
 def test_apply_simple_replacements_xml_basic_and_occurrence():
@@ -227,7 +290,7 @@ def test_apply_table_cell_fills_xml_fills_empty_target_cell():
     assert _first_text(target) == "VALUE"
 
 
-def test_apply_table_cell_fills_xml_fallback_does_not_modify_non_table_text():
+def test_apply_table_cell_fills_xml_fallback_does_not_cross_into_other_table():
     root = etree.Element("root")
     root.append(_make_table([_make_cell(0, 0, "LABEL")]))
     body_p = etree.SubElement(root, fh.HP_P_TAG)
@@ -242,9 +305,9 @@ def test_apply_table_cell_fills_xml_fallback_does_not_modify_non_table_text():
         [{"find_label": "LABEL", "value": "VALUE", "target_offset": {"col": 99, "row": 0}}],
     )
 
-    assert total == 1
+    assert total == 0
     assert body_t.text == "BODY_TEXT"
-    assert _first_text(fallback_target) == "VALUE"
+    assert _first_text(fallback_target) == "TARGET"
 
 
 def test_apply_multi_paragraph_fills_injects_multiple_paragraphs():
@@ -377,20 +440,21 @@ def test_full_fill_cycle_with_reverse_conversion_if_available(tmp_path):
     assert "역변환 기업명" in md
 
 
-def test_e2e_fill_with_sample_plan():
+def test_e2e_fill_with_sample_plan(tmp_path):
     plan = json.loads(SAMPLE_PLAN_PATH.read_text(encoding="utf-8"))
-    output = Path(plan["output_file"])
-    if output.exists():
-        output.unlink()
+    output = tmp_path / "e2e_fill_test.hwpx"
+    plan["output_file"] = str(output)
+    plan_path = tmp_path / "sample_plan.json"
+    plan_path.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
 
-    subprocess.run([sys.executable, str(SCRIPT_PATH), str(SAMPLE_PLAN_PATH)], check=True)
+    subprocess.run([sys.executable, str(SCRIPT_PATH), str(plan_path)], check=True)
     assert output.exists()
 
     with zipfile.ZipFile(output) as zf:
         assert "Contents/section0.xml" in zf.namelist()
 
     if HWP2MD_BIN.exists():
-        verify_path = Path("/tmp/e2e_verify.md")
+        verify_path = tmp_path / "e2e_verify.md"
         subprocess.run([str(HWP2MD_BIN), str(output), "-o", str(verify_path)], check=True)
         md = verify_path.read_text(encoding="utf-8")
         assert "테스트 과제명" in md
