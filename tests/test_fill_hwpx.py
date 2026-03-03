@@ -144,7 +144,14 @@ def test_get_table_index():
 
 @pytest.mark.parametrize(
     ("text", "pattern"),
-    [("OO기업", "OO"), ("○○○", "○○○"), ("1000", "000"), ("일반 텍스트", None)],
+    [
+        ("OO기업", "OO"),
+        ("○○○", "○○○"),
+        ("0000원", "0000"),
+        ("1000", None),
+        ("3,448,000", None),
+        ("일반 텍스트", None),
+    ],
 )
 def test_detect_placeholder_pattern(text, pattern):
     assert fh._detect_placeholder_pattern(text) == pattern
@@ -416,6 +423,15 @@ def test_analyze_cli_outputs_valid_schema():
     assert len(data["tables"]) == 28
     assert len(data["guide_texts"]) > 0
     assert len(data["placeholders"]) > 0
+
+
+def test_analyze_excludes_comma_formatted_amount_placeholders():
+    data = fh.analyze_template(str(TEMPLATE_PATH))
+    placeholder_texts = {entry["text"] for entry in data["placeholders"]}
+    assert "3,448,000" not in placeholder_texts
+    assert "7,652,000" not in placeholder_texts
+    assert "7,000,000" not in placeholder_texts
+    assert any("OO" in text or "○○" in text for text in placeholder_texts)
 
 
 def test_full_fill_cycle_with_reverse_conversion_if_available(tmp_path):
