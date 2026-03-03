@@ -16,6 +16,7 @@ import fill_hwpx as fh  # noqa: E402
 NS = fh.HWPX_NS["hp"]
 TEMPLATE_PATH = ROOT / "testdata" / "hwpx_20260302_200059.hwpx"
 HWP2MD_BIN = ROOT / "bin" / "hwp2md"
+SAMPLE_PLAN_PATH = ROOT / "testdata" / "fill_plans" / "재도전성공패키지_sample.json"
 
 
 def _make_cell(col, row, text="", colspan=1, rowspan=1, with_text=True):
@@ -374,3 +375,28 @@ def test_full_fill_cycle_with_reverse_conversion_if_available(tmp_path):
     md = md_path.read_text(encoding="utf-8")
     assert "역변환 과제명" in md
     assert "역변환 기업명" in md
+
+
+def test_e2e_fill_with_sample_plan():
+    plan = json.loads(SAMPLE_PLAN_PATH.read_text(encoding="utf-8"))
+    output = Path(plan["output_file"])
+    if output.exists():
+        output.unlink()
+
+    subprocess.run([sys.executable, str(SCRIPT_PATH), str(SAMPLE_PLAN_PATH)], check=True)
+    assert output.exists()
+
+    with zipfile.ZipFile(output) as zf:
+        assert "Contents/section0.xml" in zf.namelist()
+
+    if HWP2MD_BIN.exists():
+        verify_path = Path("/tmp/e2e_verify.md")
+        subprocess.run([str(HWP2MD_BIN), str(output), "-o", str(verify_path)], check=True)
+        md = verify_path.read_text(encoding="utf-8")
+        assert "테스트 과제명" in md
+        assert "테스트 기업명" in md
+    else:
+        with zipfile.ZipFile(output) as zf:
+            xml = zf.read("Contents/section0.xml").decode("utf-8")
+            assert "테스트 과제명" in xml
+            assert "테스트 기업명" in xml
